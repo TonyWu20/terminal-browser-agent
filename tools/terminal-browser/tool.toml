@@ -1,0 +1,22 @@
+[tool]
+description = "Drive the terminal-browser web browser from the agent: open pages, snapshot the DOM, evaluate JS, click elements, and download PDFs — including through in-page PDF viewers that block direct transfers."
+command = "tb"
+args = []
+# The pdf op polls the viewer (up to 20 s) plus the download itself.
+timeout_ms = 300000
+
+[tool.schema]
+type = "object"
+required = ["op"]
+
+[tool.schema.properties.op]
+type = "string"
+description = "Operation: 'open' start a browser pane; 'ls' list browsers/tabs; 'goto' navigate the active tab; 'shot' accessibility snapshot with element refs; 'get' evaluate JS in the active tab; 'click' an @ref or CSS selector; 'pdf' download a PDF (viewer-aware); 'shutdown' stop the daemon."
+
+[tool.schema.properties.a]
+type = "string"
+description = "open/goto: URL. get: JS expression. click: element ref (@eNN from shot) or CSS selector. pdf: PDF URL."
+
+[tool.schema.properties.b]
+type = "string"
+description = "pdf only: output file path (default: ./<basename of the URL>)."

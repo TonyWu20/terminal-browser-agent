@@ -1,0 +1,174 @@
+#!/bin/sh
+# tb — rushi tool wrapper for the `terminal-browser` web browser.
+#
+# terminal-browser drives a real browser (Electron + CDP) from the
+# terminal. This wrapper makes its agent workflow one self-documenting
+# command, in the rushi "OS + applications" style:
+#   - registers via tools/terminal-browser/tool.toml (route discovery)
+#   - self-documents via `tb help`
+#   - the multi-step procedure (PDF download through an in-page viewer)
+#     is executable, not a doc file
+#
+# rushi ABI (route): JSON tool-call arguments on stdin; one JSON result
+# object on stdout:  {"text":…, "exit_code":…, "stdout":…, "stderr":…}.
+# Standalone: CLI arguments.  Piped stdin that carries JSON wins; an
+# empty pipe falls through to CLI mode.
+#
+#   stdin JSON: {"op":"pdf","a":"https://…","b":"out.pdf"}
+#   CLI:        tb pdf https://… out.pdf
+
+set -u
+
+TB=terminal-browser
+OUTF=$(mktemp)
+ERRF=$(mktemp)
+
+cleanup() {
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$OUTF" "$ERRF"
+  else
+    errtext=$(cat "$ERRF" 2>/dev/null | sed -e 's/"/\\"/g' | tr '\n\t' '  ')
+    printf '{"text":"tb failed","exit_code":%s,"stdout":"","stderr":"%s"}\n' "$rc" "$errtext"
+    rm -f "$OUTF" "$ERRF"
+  fi
+}
+trap cleanup EXIT
+
+# ── run <op> <a> <b>: execute, output goes to the caller's stdout/err ──
+run() {
+  op="$1"; a="$2"; b="$3"
+  case "$op" in
+    help|-h|--help)
+      cat <<'EOF'
+tb — drive the terminal-browser web browser (agent workflow)
+
+Usage:  tb <op> [a] [b]        (or via rushi: JSON args on stdin)
+
+Operations:
+  open  <url>              Open <url> in a browser pane (new browser if none)
+  ls                       List running browsers and their tabs
+  goto <url>               Navigate the active tab to <url>
+  shot                     Accessibility snapshot of the active tab
+                           (element refs like @e12 — valid until the DOM changes)
+  get  <js>                Evaluate <js> in the active tab; print the value
+  click <ref|selector>    Click an element: @eNN ref from `shot`, or a CSS
+                           selector (selectors do NOT cross iframes; refs do)
+  pdf  <url> [out]        Download a PDF, handling sites that open the
+                           in-page PDF viewer instead of transferring the file.
+                           out defaults to ./<basename-of-url>.
+  shutdown                 Stop the terminal-browser daemon
+
+Notes:
+  - After goto/open, poll `shot` until the target element appears; pages
+    block on load.  Refs go stale when the DOM changes — re-snapshot.
+  - Wrap multi-statement JS in an IIFE: eval reuses variable scope.
+  - `click`/`download` on an element covered by a sticky header fails;
+    navigate straight to the URL instead.
+EOF
+      return 0
+      ;;
+    open)
+      [ -n "${a:-}" ] || { printf 'usage: tb open <url>\n' >&2; return 64; }
+      "$TB" open "$a"
+      ;;
+    ls)    "$TB" ls ;;
+    goto)
+      [ -n "${a:-}" ] || { printf 'usage: tb goto <url>\n' >&2; return 64; }
+      "$TB" action -- open "$a"
+      ;;
+    shot)  "$TB" action -- snapshot ;;
+    get)
+      [ -n "${a:-}" ] || { printf 'usage: tb get <js>\n' >&2; return 64; }
+      "$TB" action -- eval "$a"
+      ;;
+    click)
+      [ -n "${a:-}" ] || { printf 'usage: tb click <ref|selector>\n' >&2; return 64; }
+      "$TB" action -- click "$a"
+      ;;
+    pdf)
+      [ -n "${a:-}" ] || { printf 'usage: tb pdf <url> [out]\n' >&2; return 64; }
+      pdf_url="$a"
+      out="${b:-}"
+      [ -n "$out" ] || out="./$(basename "$pdf_url")"
+      case "$out" in */) out="$out$(basename "$pdf_url")" ;; esac
+      # 1) navigate straight to the PDF URL: sites open the in-page viewer
+      "$TB" open "$pdf_url" >/dev/null 2>&1
+      # 2) poll the viewer for its Download button (the viewer loads
+      #    lazily; the ref only exists once the toolbar is up)
+      ref=""
+      i=0
+      while [ "$i" -lt 20 ]; do
+        ref=$("$TB" action -- snapshot 2>/dev/null \
+          | sed -n 's/.*button "Download" \[ref=\(e[0-9][0-9]*\)\].*/\1/p' | sed -n 1p)
+        [ -n "$ref" ] && break
+        i=$((i+1)); sleep 1
+      done
+      if [ -n "$ref" ]; then
+        # 3) the viewer's Download button fires a real download event
+        if "$TB" action -- download "@$ref" "$out" 2>&1; then
+          printf 'Download saved to %s\n' "$out"
+          return 0
+        fi
+        printf 'error: viewer download failed\n' >&2
+        return 1
+      fi
+      # fallback: a plain file link on the page that transfers directly
+      if "$TB" action -- download "a[href*='pdf']" "$out" 2>&1; then
+        printf 'Download saved to %s\n' "$out"
+        return 0
+      fi
+      printf 'error: no download path found on page\n' >&2
+      return 1
+      ;;
+    shutdown) "$TB" shutdown ;;
+    *)
+      printf 'unknown op: %s\n' "$op" >&2
+      return 64
+      ;;
+  esac
+}
+
+# ── JSON string escaper (route ABI) ──
+jesc() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr '\n' ' '
+}
+
+# ── intake: piped JSON (route ABI) when non-empty, else CLI ──
+JSON=
+if [ ! -t 0 ]; then
+  JSON=$(cat 2>/dev/null)
+fi
+if [ -n "$JSON" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    eval "$(printf '%s' "$JSON" | python3 -c '
+import json, sys, shlex
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+for k in ("op", "a", "b"):
+    v = d.get(k, "")
+    if not isinstance(v, str):
+        v = json.dumps(v)
+    print("%s=%s" % (k, shlex.quote(v)))
+')"
+  else
+    # sed fallback: flat JSON, values free of quotes/newlines
+    op=$(printf '%s' "$JSON" | sed -n 's/.*"op"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p)
+    a=$(printf '%s' "$JSON" | sed -n 's/.*"a"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p)
+    b=$(printf '%s' "$JSON" | sed -n 's/.*"b"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p)
+  fi
+  # route ABI: run with capture, emit one JSON result object
+  run "${op:-help}" "${a:-}" "${b:-}" >"$OUTF" 2>"$ERRF"
+  rc=$?
+  printf '{"text":"%s","exit_code":%s,"stdout":"%s","stderr":"%s"}\n' \
+    "$(jesc "$(cat "$OUTF")")" "$rc" "$(jesc "$(cat "$OUTF")")" "$(jesc "$(cat "$ERRF")")"
+  rm -f "$OUTF" "$ERRF"
+  trap - EXIT
+  exit $rc
+fi
+
+# ── CLI mode: run, show output ──
+run "${1:-help}" "${2:-}" "${3:-}"
+exit $?
