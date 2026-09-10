@@ -21,24 +21,50 @@ point (ops: `open`, `ls`, `goto`, `shot`, `get`, `click`, `pdf`,
 
 ## PDF downloads (the case that breaks naive agents)
 
-Journal sites (arXiv, IEEE, Elsevier, …) serve the PDF **inline**:
-clicking "Download PDF" opens the in-page PDF *viewer* instead of
-transferring the file. A download-event-based tool then times out
-waiting for an event that never fires.
+Journal sites (arXiv, IEEE, Elsevier, Wiley, …) serve the PDF
+**inline**: clicking "Download PDF" opens the in-page PDF *viewer*
+instead of transferring the file. A download-event-based tool then
+times out waiting for an event that never fires.
 
-The working recipe (what `tb pdf` automates):
+### Primary strategy: CDP + in-page fetch (what `tb pdf` does)
 
-1. Navigate **straight to the PDF URL** (`tb goto https://…/pdf/<id>`
-   or `tb open`). The site's viewer loads in an iframe.
-2. **Poll** `tb shot` until the viewer's toolbar renders — a progress
-   bar shows while the PDF streams; the "Download" button ref exists
-   only after load. (arXiv: 3–15 s typical.)
-3. **Click the viewer's own Download button** — `terminal-browser
-   action -- download @<ref> <path>` captures the download event and
-   saves to disk. The result line is `✓ Download saved to <path>`.
+Works for **any** site whose page can fetch the PDF bytes with the
+browser's own session (cookies, auth headers). This includes
+paywalled journal sites accessible via a university VPN/proxy:
 
-Verified on: arxiv.org PDF viewer (buttons inside an iframe),
-example.com (link navigation), google.com searches.
+1. `terminal-browser open <pdf-page-url>` — navigate the browser to
+   the article or PDF URL so the browser is in the right origin
+   context (same-origin fetch will carry session cookies).
+2. `terminal-browser ls --json` → extract `cdpPort` from the browser
+   entry.
+3. Run `node cdp-download.mjs <cdpPort> <url-substr> <pdf-url> <out-dir>`:
+   - Connects to the CDP browser endpoint (`ws://127.0.0.1:<port>/devtools/browser/…`).
+   - Finds the page target matching the URL substring.
+   - Navigates that target to the PDF URL (ensures a JS-capable context).
+   - Sets `Browser.setDownloadBehavior` to allow downloads into `<out-dir>`.
+   - In-page JS: `fetch(pdfUrl, {credentials:'include'})` → blob →
+     `URL.createObjectURL` → synthetic `<a download>.click()`.
+   - Polls `<out-dir>` until a new file appears and its size stabilises.
+   - Prints the file path on success.
+4. The file is saved to the specified `out` path (relative to the
+   caller's cwd).
+
+This handles the "PDF opens in a viewer, not as a download" problem
+without needing a Download button in the viewer toolbar.
+
+### Fallback: viewer's own Download button
+
+If CDP is unavailable (no `node`, no `cdpPort`), `tb pdf` falls back
+to the viewer-button recipe:
+
+1. Navigate straight to the PDF URL.
+2. Poll `tb shot` until the viewer's toolbar renders (3–15 s typical
+   for arXiv; the "Download" button ref exists only after load).
+3. Click the viewer's Download button —
+   `terminal-browser action -- download @<ref> <path>`.
+
+Verified on: arxiv.org, onlinelibrary.wiley.com (paywalled via
+university network), example.com, google.com.
 
 ## Pitfalls learned the hard way
 
@@ -57,18 +83,29 @@ example.com (link navigation), google.com searches.
   Wrap multi-statement JS in an IIFE: `(() => { const t=…; return t })()`.
 - **Page load blocks**: `shot`/`get` right after `goto` may block on
   load; budget generous timeouts (the harness bash cap is 300 s).
-- **Search engines**: DuckDuckGo HTML (`https://html.duckduckgo.com/html/?q=…`)
-  is the agent-friendly choice (no consent wall, parseable result
-  links). Google works too but is region-routed and JS-heavy; its
-  Scholar links still carry the arXiv IDs.
+- **Search engines**: DuckDuckGo HTML
+  (`https://html.duckduckgo.com/html/?q=…`) is the agent-friendly
+  choice (no consent wall, parseable result links). Google works too
+  but is region-routed and JS-heavy; its Scholar links still carry the
+  arXiv IDs.
 - **Verify downloads**: check `%PDF` header + `%%EOF` marker; the
   `file(1)` page count is unreliable for compressed PDFs.
+- **CDP download quirks**: Electron may not fire
+  `Browser.downloadProgress` events reliably; poll the download
+  directory for the new file instead of relying on CDP events.
+- **Paywalled sites**: the CDP in-page fetch carries the browser's
+  session cookies, so university VPN/proxy auth works transparently.
+  Direct `curl` or `wget` will fail on these sites.
 
 ## Notes
 
 - The browser instance persists across `tb` calls (daemon + CDP).
   `tb ls` shows keys; `--browser <key>` / `--tab <id>` selectors on
   `terminal-browser action` target specific instances/tabs.
+- `tb ls --json` exposes `cdpPort` per browser instance, needed for
+  the CDP download path.
 - In a rushi session this tool arrives as the `terminal-browser`
   tool (JSON args on stdin, one JSON result object on stdout).
   Standalone it is the `tb` CLI: `tb <op> [a] [b]`.
+- `tb pdf` requires Node ≥ 22 (for global `WebSocket` + `fetch`)
+  when using the CDP path; the button fallback works without Node.

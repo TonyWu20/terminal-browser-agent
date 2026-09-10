@@ -11,7 +11,7 @@ required = ["op"]
 
 [tool.schema.properties.op]
 type = "string"
-description = "Operation: 'open' start a browser pane; 'ls' list browsers/tabs; 'goto' navigate the active tab; 'shot' accessibility snapshot with element refs; 'get' evaluate JS in the active tab; 'click' an @ref or CSS selector; 'pdf' download a PDF (viewer-aware); 'shutdown' stop the daemon."
+description = "Operation: 'open' start a browser pane; 'ls' list browsers/tabs; 'goto' navigate the active tab; 'shot' accessibility snapshot with element refs; 'get' evaluate JS in the active tab; 'click' an @ref or CSS selector; 'pdf' download a PDF (CDP + in-page fetch; paywalled pages work via browser session; falls back to viewer button); 'shutdown' stop the daemon."
 
 [tool.schema.properties.a]
 type = "string"

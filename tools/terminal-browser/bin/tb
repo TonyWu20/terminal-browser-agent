@@ -1,174 +1,148 @@
 #!/bin/sh
-# tb — rushi tool wrapper for the `terminal-browser` web browser.
+# tb — terminal-browser, single-line for the rushi tool ABI.
 #
-# terminal-browser drives a real browser (Electron + CDP) from the
-# terminal. This wrapper makes its agent workflow one self-documenting
-# command, in the rushi "OS + applications" style:
-#   - registers via tools/terminal-browser/tool.toml (route discovery)
-#   - self-documents via `tb help`
-#   - the multi-step procedure (PDF download through an in-page viewer)
-#     is executable, not a doc file
+# Two calling styles:
+#   CLI   : tb <op> [arg1] [arg2]        (human/agent-friendly, one call per line)
+#   rushi : stdin  {"op":"open","a":"https://..."}   (route/assembler tool ABI)
+#           stdout one JSON object: {"output":...} or {"error":"..."}
 #
-# rushi ABI (route): JSON tool-call arguments on stdin; one JSON result
-# object on stdout:  {"text":…, "exit_code":…, "stdout":…, "stderr":…}.
-# Standalone: CLI arguments.  Piped stdin that carries JSON wins; an
-# empty pipe falls through to CLI mode.
+# Every op is a thin, atomic wrapper around the `terminal-browser` CLI
+# (open/ls are terminal-browser subcommands; everything else goes through
+# `terminal-browser action -- <...>`).
 #
-#   stdin JSON: {"op":"pdf","a":"https://…","b":"out.pdf"}
-#   CLI:        tb pdf https://… out.pdf
-
-set -u
+# Ops (a=arg1, b=arg2):
+#   open <url>                  open in a browser pane (creates browser if needed)
+#   ls                          list this session's browser + tabs
+#   goto <url>                  navigate the active tab
+#   shot <path.png>            full-page screenshot
+#   get <selector> [prop]      element text/content, or innerHTML when prop="html"
+#   click <selector>           click by CSS selector (fallback; prefer snapshot refs)
+#   pdf <url> [out.pdf]        download a PDF the page renders in its viewer
+#   shutdown                    stop the terminal browser
+set -eu
 
 TB=terminal-browser
-OUTF=$(mktemp)
-ERRF=$(mktemp)
+SELF_DIR=$(dirname -- "$0")
 
-cleanup() {
-  rc=$?
-  if [ "$rc" -eq 0 ]; then
-    rm -f "$OUTF" "$ERRF"
-  else
-    errtext=$(cat "$ERRF" 2>/dev/null | sed -e 's/"/\\"/g' | tr '\n\t' '  ')
-    printf '{"text":"tb failed","exit_code":%s,"stdout":"","stderr":"%s"}\n' "$rc" "$errtext"
-    rm -f "$OUTF" "$ERRF"
-  fi
+out()  { printf '%s' "$1"; }
+# In-band error: emit a JSON error object (exit 0 = the wrapper itself ran fine;
+# the failure is in-band in the JSON, which the model can read directly).
+die()  { printf '{"error":%s}\n' "$(json_escape "error: $1")"; exit 0; }
+
+# JSON-escape a string (backslash, quote, control chars).
+json_escape() {
+  printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()), end="")'
 }
-trap cleanup EXIT
 
-# ── run <op> <a> <b>: execute, output goes to the caller's stdout/err ──
-run() {
-  op="$1"; a="$2"; b="$3"
-  case "$op" in
-    help|-h|--help)
-      cat <<'EOF'
-tb — drive the terminal-browser web browser (agent workflow)
+# run a terminal-browser CLI command, capture output, emit a JSON result object
+run_cli() {
+  # $1 = op name (for messages); rest = terminal-browser args
+  op=$1; shift
+  errf=$(mktemp)
+  rc_out=$("$TB" "$@" 2>"$errf") || { rc=$?; printf '{"error":%s}\n' "$(json_escape "$TB $* -> exit $rc: $(cat "$errf")")"; rm -f "$errf"; return 0; }
+  printf '{"output":%s}\n' "$(json_escape "$rc_out")"
+  rm -f "$errf"
+}
 
-Usage:  tb <op> [a] [b]        (or via rushi: JSON args on stdin)
-
-Operations:
-  open  <url>              Open <url> in a browser pane (new browser if none)
-  ls                       List running browsers and their tabs
-  goto <url>               Navigate the active tab to <url>
-  shot                     Accessibility snapshot of the active tab
-                           (element refs like @e12 — valid until the DOM changes)
-  get  <js>                Evaluate <js> in the active tab; print the value
-  click <ref|selector>    Click an element: @eNN ref from `shot`, or a CSS
-                           selector (selectors do NOT cross iframes; refs do)
-  pdf  <url> [out]        Download a PDF, handling sites that open the
-                           in-page PDF viewer instead of transferring the file.
-                           out defaults to ./<basename-of-url>.
-  shutdown                 Stop the terminal-browser daemon
-
-Notes:
-  - After goto/open, poll `shot` until the target element appears; pages
-    block on load.  Refs go stale when the DOM changes — re-snapshot.
-  - Wrap multi-statement JS in an IIFE: eval reuses variable scope.
-  - `click`/`download` on an element covered by a sticky header fails;
-    navigate straight to the URL instead.
-EOF
-      return 0
-      ;;
-    open)
-      [ -n "${a:-}" ] || { printf 'usage: tb open <url>\n' >&2; return 64; }
-      "$TB" open "$a"
-      ;;
-    ls)    "$TB" ls ;;
-    goto)
-      [ -n "${a:-}" ] || { printf 'usage: tb goto <url>\n' >&2; return 64; }
-      "$TB" action -- open "$a"
-      ;;
-    shot)  "$TB" action -- snapshot ;;
-    get)
-      [ -n "${a:-}" ] || { printf 'usage: tb get <js>\n' >&2; return 64; }
-      "$TB" action -- eval "$a"
-      ;;
-    click)
-      [ -n "${a:-}" ] || { printf 'usage: tb click <ref|selector>\n' >&2; return 64; }
-      "$TB" action -- click "$a"
-      ;;
-    pdf)
-      [ -n "${a:-}" ] || { printf 'usage: tb pdf <url> [out]\n' >&2; return 64; }
-      pdf_url="$a"
-      out="${b:-}"
-      [ -n "$out" ] || out="./$(basename "$pdf_url")"
-      case "$out" in */) out="$out$(basename "$pdf_url")" ;; esac
-      # 1) navigate straight to the PDF URL: sites open the in-page viewer
-      "$TB" open "$pdf_url" >/dev/null 2>&1
-      # 2) poll the viewer for its Download button (the viewer loads
-      #    lazily; the ref only exists once the toolbar is up)
-      ref=""
-      i=0
-      while [ "$i" -lt 20 ]; do
-        ref=$("$TB" action -- snapshot 2>/dev/null \
-          | sed -n 's/.*button "Download" \[ref=\(e[0-9][0-9]*\)\].*/\1/p' | sed -n 1p)
-        [ -n "$ref" ] && break
-        i=$((i+1)); sleep 1
-      done
-      if [ -n "$ref" ]; then
-        # 3) the viewer's Download button fires a real download event
-        if "$TB" action -- download "@$ref" "$out" 2>&1; then
-          printf 'Download saved to %s\n' "$out"
-          return 0
-        fi
-        printf 'error: viewer download failed\n' >&2
-        return 1
-      fi
-      # fallback: a plain file link on the page that transfers directly
-      if "$TB" action -- download "a[href*='pdf']" "$out" 2>&1; then
-        printf 'Download saved to %s\n' "$out"
-        return 0
-      fi
-      printf 'error: no download path found on page\n' >&2
-      return 1
-      ;;
-    shutdown) "$TB" shutdown ;;
-    *)
-      printf 'unknown op: %s\n' "$op" >&2
-      return 64
-      ;;
+# ---- resolve input -----------------------------------------------------------
+if [ ! -t 0 ] && [ ! -e /dev/stdin ]; then args_json=""; fi
+if [ -n "${TB_JSON:-}" ]; then
+  args_json=$TB_JSON
+elif [ ! -t 0 ]; then
+  args_json=$(cat)
+  case "$args_json" in
+    ""|*[![:print:][:space:]]*) args_json="" ;;
   esac
-}
-
-# ── JSON string escaper (route ABI) ──
-jesc() {
-  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr '\n' ' '
-}
-
-# ── intake: piped JSON (route ABI) when non-empty, else CLI ──
-JSON=
-if [ ! -t 0 ]; then
-  JSON=$(cat 2>/dev/null)
 fi
-if [ -n "$JSON" ]; then
-  if command -v python3 >/dev/null 2>&1; then
-    eval "$(printf '%s' "$JSON" | python3 -c '
-import json, sys, shlex
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = {}
-for k in ("op", "a", "b"):
-    v = d.get(k, "")
-    if not isinstance(v, str):
-        v = json.dumps(v)
-    print("%s=%s" % (k, shlex.quote(v)))
-')"
+
+if [ -n "$args_json" ]; then
+  # rushi ABI: {"op":"...","a":"...","b":"..."}
+  read -r op a b <<JSON
+$(printf '%s' "$args_json" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+print(d.get("op",""),d.get("a",""),d.get("b",""))
+')
+JSON
+else
+  op=$1; shift || true
+  a=${1:-}; b=${2:-}
+fi
+[ -n "$op" ] || die "no op given"
+
+case "$op" in
+open)
+  [ -n "$a" ] || die "open needs <url>"
+  run_cli open open "$a" ;;
+ls)
+  run_cli ls ls ;;
+goto)
+  [ -n "$a" ] || die "goto needs <url>"
+  run_cli goto action -- open "$a" ;;
+shot)
+  [ -n "$a" ] || die "shot needs <path.png>"
+  run_cli shot action -- screenshot --full "$a" ;;
+get)
+  [ -n "$a" ] || die "get needs <selector>"
+  if [ -n "$b" ] && [ "$b" = html ]; then
+    run_cli get action -- get "$a" --inner-html
   else
-    # sed fallback: flat JSON, values free of quotes/newlines
-    op=$(printf '%s' "$JSON" | sed -n 's/.*"op"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p)
-    a=$(printf '%s' "$JSON" | sed -n 's/.*"a"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p)
-    b=$(printf '%s' "$JSON" | sed -n 's/.*"b"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p)
+    run_cli get action -- get "$a"
+  fi ;;
+click)
+  [ -n "$a" ] || die "click needs <selector>"
+  run_cli click action -- click "$a" ;;
+pdf)
+  # Download a PDF from a page whose "Download" button renders the document
+  # in an in-page viewer (arXiv, …) instead of transferring the file.
+  pdf_url=$a; out=${b:-}
+  [ -n "$out" ] || out=./$(basename "$pdf_url")
+  case "$out" in */) out="$out$(basename "$pdf_url")" ;; esac
+  outdir=$(dirname -- "$out"); [ -d "$outdir" ] || mkdir -p "$outdir"
+  cdp_port=""
+  if command -v node >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    cdp_port=$("$TB" ls --json 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for b in d.get("browsers",[]):
+    if b.get("cdpPort"): print(b["cdpPort"]); break
+' 2>/dev/null || true)
   fi
-  # route ABI: run with capture, emit one JSON result object
-  run "${op:-help}" "${a:-}" "${b:-}" >"$OUTF" 2>"$ERRF"
-  rc=$?
-  printf '{"text":"%s","exit_code":%s,"stdout":"%s","stderr":"%s"}\n' \
-    "$(jesc "$(cat "$OUTF")")" "$rc" "$(jesc "$(cat "$OUTF")")" "$(jesc "$(cat "$ERRF")")"
-  rm -f "$OUTF" "$ERRF"
-  trap - EXIT
-  exit $rc
-fi
-
-# ── CLI mode: run, show output ──
-run "${1:-help}" "${2:-}" "${3:-}"
-exit $?
+  if [ -n "$cdp_port" ]; then
+    host=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.urlparse(sys.argv[1]).netloc)' "$pdf_url" 2>/dev/null || true)
+    tmpdl=$(mktemp -d)
+    cderr=$(mktemp)
+    got=$(node "$SELF_DIR/cdp-download.mjs" "$cdp_port" "$host" "$pdf_url" "$tmpdl" 2>"$cderr") || rc_cdp=$?
+    if [ -n "$got" ] && [ -f "$got" ]; then
+      mv -f "$got" "$out"
+      rm -rf "$tmpdl" "$cderr"
+      printf '{"output":%s}\n' "$(json_escape "Download saved to $out")"
+      exit 0
+    fi
+    rm -rf "$tmpdl"
+    printf 'warning: CDP download path unavailable, trying viewer button (cdp err: %s)\n' "$(head -c 300 "$cderr")" >&2
+    rm -f "$cderr"
+  fi
+  # fallback: the viewer's own Download button (works without Node/CDP)
+  ref=""
+  i=0
+  while [ "$i" -lt 20 ]; do
+    ref=$("$TB" action -- snapshot 2>/dev/null | sed -n 's/.*button "Download" \[ref=\(e[0-9][0-9]*\)\].*/\1/p' | sed -n 1p)
+    [ -n "$ref" ] && break
+    i=$((i+1)); sleep 1
+  done
+  if [ -n "$ref" ]; then
+    if "$TB" action -- download "@$ref" "$out" >/dev/null 2>&1; then
+      printf '{"output":%s}\n' "$(json_escape "Download saved to $out")"
+      exit 0
+    fi
+    die "viewer download failed"
+  fi
+  die "no download path found on page (viewer Download button not found; CDP unavailable?)" ;;
+shutdown)
+  run_cli shutdown shutdown ;;
+*)
+  die "unknown op '$op' (open|ls|goto|shot|get|click|pdf|shutdown)" ;;
+esac

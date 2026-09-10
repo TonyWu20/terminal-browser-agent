@@ -23,7 +23,7 @@ PY
 
 # 3) route-ABI JSON in -> JSON out, and the JSON parses
 out=$(printf '{"op":"ls"}' | "$TB" 2>/dev/null)
-printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "text" in d and "exit_code" in d' \
+printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "output" in d or "error" in d' \
   || { echo "FAIL: ABI JSON"; fail=1; }
 [ "$fail" -eq 0 ] && echo "ABI ok: $(printf '%s' "$out" | head -c 80)…"
 
