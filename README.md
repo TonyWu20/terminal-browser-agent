@@ -60,6 +60,8 @@ Either way `assemble` adds one line to the prompt prefix:
 
 ## Nix flake (Mode B)
 
+The flake is hosted at `github:TonyWu20/terminal-browser-agent`.
+
 The repo ships a `flake.nix` following the rushi
 `ext-flake-authoring` pattern. It exposes one tool package per
 system. There is no cargo build. The package is a plain copy of
@@ -85,7 +87,7 @@ Consumer wiring (see `rust-unix-harness/examples/rushi-config`):
 
     # consumer flake
     inputs = {
-      tbAgent.url = "github:<user>/terminal-browser-agent";
+      tbAgent.url = "github:TonyWu20/terminal-browser-agent";
       # plus the kernel flake input that provides lib.mkRushi
     };
 
