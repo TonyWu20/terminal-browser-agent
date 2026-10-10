@@ -58,6 +58,45 @@ Either way `assemble` adds one line to the prompt prefix:
 `terminal-browser: Drive the terminal-browser web browser…`
 (a one-time prefix rebuild, per the cache rule).
 
+## Nix flake (Mode B)
+
+The repo ships a `flake.nix` following the rushi
+`ext-flake-authoring` pattern. It exposes one tool package per
+system. There is no cargo build. The package is a plain copy of
+`tools/terminal-browser/` into the tool `$out` contract:
+
+    $out/terminal-browser/tool.toml
+    $out/terminal-browser/bin/tb
+    $out/terminal-browser/bin/cdp-download.mjs
+    $out/terminal-browser/docs/procedure.md
+
+Build and gate it:
+
+    nix build .#terminal-browser          # or .#default
+    nix build .#checks.x86_64-linux.tool-layout   # P1 layout check
+
+The package declares `meta.rushi.entry = "terminal-browser"`. When
+a consumer passes the package to `rushi.external_tools`, the kernel
+`lib.mkRushi` fills `[paths] extension_tool_paths` with
+`"tools/terminal-browser"` at eval time (issue #13). It needs no
+second hand-typed copy.
+
+Consumer wiring (see `rust-unix-harness/examples/rushi-config`):
+
+    # consumer flake
+    inputs = {
+      tbAgent.url = "github:<user>/terminal-browser-agent";
+      # plus the kernel flake input that provides lib.mkRushi
+    };
+
+    rushi.external_tools = [
+      tbAgent.packages.x86_64-linux."terminal-browser"
+    ];
+
+The `terminal-browser` binary and `python3` are runtime PATH
+dependencies of the tool. They are not build inputs. Provide them in
+the agent environment.
+
 ## Standalone use
 
     tools/terminal-browser/bin/tb help
